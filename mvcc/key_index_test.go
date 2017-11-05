@@ -205,7 +205,7 @@ func TestKeyIndexTombstone(t *testing.T) {
 	}
 }
 
-func TestKeyIndexCompact(t *testing.T) {
+func TestKeyIndexCompactAndKeep(t *testing.T) {
 	tests := []struct {
 		compact int64
 
@@ -239,7 +239,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 2}: {},
+				{main: 2}: {},
 			},
 		},
 		{
@@ -255,7 +255,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 2}: {},
+				{main: 2}: {},
 			},
 		},
 		{
@@ -271,7 +271,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 4}: {},
+				{main: 4}: {},
 			},
 		},
 		{
@@ -287,7 +287,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 4}: {},
+				{main: 4}: {},
 			},
 		},
 		{
@@ -328,7 +328,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 8}: {},
+				{main: 8}: {},
 			},
 		},
 		{
@@ -343,7 +343,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 8}: {},
+				{main: 8}: {},
 			},
 		},
 		{
@@ -358,7 +358,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 10}: {},
+				{main: 10}: {},
 			},
 		},
 		{
@@ -373,7 +373,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 10}: {},
+				{main: 10}: {},
 			},
 		},
 		{
@@ -411,7 +411,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 14, sub: 1}: {},
+				{main: 14, sub: 1}: {},
 			},
 		},
 		{
@@ -425,7 +425,7 @@ func TestKeyIndexCompact(t *testing.T) {
 				},
 			},
 			map[revision]struct{}{
-				revision{main: 14, sub: 1}: {},
+				{main: 14, sub: 1}: {},
 			},
 		},
 		{
@@ -441,10 +441,19 @@ func TestKeyIndexCompact(t *testing.T) {
 		},
 	}
 
-	// Continuous Compaction
+	// Continuous Compaction and finding Keep
 	ki := newTestKeyIndex()
 	for i, tt := range tests {
 		am := make(map[revision]struct{})
+		kiclone := cloneKeyIndex(ki)
+		ki.keep(tt.compact, am)
+		if !reflect.DeepEqual(ki, kiclone) {
+			t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiclone)
+		}
+		if !reflect.DeepEqual(am, tt.wam) {
+			t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+		}
+		am = make(map[revision]struct{})
 		ki.compact(tt.compact, am)
 		if !reflect.DeepEqual(ki, tt.wki) {
 			t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
@@ -454,11 +463,20 @@ func TestKeyIndexCompact(t *testing.T) {
 		}
 	}
 
-	// Jump Compaction
+	// Jump Compaction and finding Keep
 	ki = newTestKeyIndex()
 	for i, tt := range tests {
 		if (i%2 == 0 && i < 6) || (i%2 == 1 && i > 6) {
 			am := make(map[revision]struct{})
+			kiclone := cloneKeyIndex(ki)
+			ki.keep(tt.compact, am)
+			if !reflect.DeepEqual(ki, kiclone) {
+				t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiclone)
+			}
+			if !reflect.DeepEqual(am, tt.wam) {
+				t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+			}
+			am = make(map[revision]struct{})
 			ki.compact(tt.compact, am)
 			if !reflect.DeepEqual(ki, tt.wki) {
 				t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
@@ -469,10 +487,19 @@ func TestKeyIndexCompact(t *testing.T) {
 		}
 	}
 
-	// Once Compaction
+	kiClone := newTestKeyIndex()
+	// Once Compaction and finding Keep
 	for i, tt := range tests {
 		ki := newTestKeyIndex()
 		am := make(map[revision]struct{})
+		ki.keep(tt.compact, am)
+		if !reflect.DeepEqual(ki, kiClone) {
+			t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiClone)
+		}
+		if !reflect.DeepEqual(am, tt.wam) {
+			t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+		}
+		am = make(map[revision]struct{})
 		ki.compact(tt.compact, am)
 		if !reflect.DeepEqual(ki, tt.wki) {
 			t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
@@ -481,6 +508,23 @@ func TestKeyIndexCompact(t *testing.T) {
 			t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
 		}
 	}
+}
+
+func cloneKeyIndex(ki *keyIndex) *keyIndex {
+	generations := make([]generation, len(ki.generations))
+	for i, gen := range ki.generations {
+		generations[i] = *cloneGeneration(&gen)
+	}
+	return &keyIndex{ki.key, ki.modified, generations}
+}
+
+func cloneGeneration(g *generation) *generation {
+	if g.revs == nil {
+		return &generation{g.ver, g.created, nil}
+	}
+	tmp := make([]revision, len(g.revs))
+	copy(tmp, g.revs)
+	return &generation{g.ver, g.created, tmp}
 }
 
 // test that compact on version that higher than last modified version works well
@@ -499,7 +543,7 @@ func TestKeyIndexCompactOnFurtherRev(t *testing.T) {
 		},
 	}
 	wam := map[revision]struct{}{
-		revision{main: 2}: {},
+		{main: 2}: {},
 	}
 	if !reflect.DeepEqual(ki, wki) {
 		t.Errorf("ki = %+v, want %+v", ki, wki)

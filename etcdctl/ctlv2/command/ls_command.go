@@ -54,7 +54,7 @@ func lsCommandFunc(c *cli.Context, ki client.KeysAPI) {
 	resp, err := ki.Get(ctx, key, &client.GetOptions{Sort: sort, Recursive: recursive, Quorum: quorum})
 	cancel()
 	if err != nil {
-		handleError(ExitServerError, err)
+		handleError(c, ExitServerError, err)
 	}
 
 	printLs(c, resp)
@@ -63,11 +63,16 @@ func lsCommandFunc(c *cli.Context, ki client.KeysAPI) {
 // printLs writes a response out in a manner similar to the `ls` command in unix.
 // Non-empty directories list their contents and files list their name.
 func printLs(c *cli.Context, resp *client.Response) {
-	if !resp.Node.Dir {
-		fmt.Println(resp.Node.Key)
-	}
-	for _, node := range resp.Node.Nodes {
-		rPrint(c, node)
+	if c.GlobalString("output") == "simple" {
+		if !resp.Node.Dir {
+			fmt.Println(resp.Node.Key)
+		}
+		for _, node := range resp.Node.Nodes {
+			rPrint(c, node)
+		}
+	} else {
+		// user wants JSON or extended output
+		printResponseKey(resp, c.GlobalString("output"))
 	}
 }
 

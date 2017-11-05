@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package cache exports functionality for efficiently caching and mapping
+// `RangeRequest`s to corresponding `RangeResponse`s.
 package cache
 
 import (
@@ -20,6 +22,7 @@ import (
 
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/pkg/adt"
 	"github.com/golang/groupcache/lru"
 )
 
@@ -32,9 +35,12 @@ type Cache interface {
 	Add(req *pb.RangeRequest, resp *pb.RangeResponse)
 	Get(req *pb.RangeRequest) (*pb.RangeResponse, error)
 	Compact(revision int64)
+	Invalidate(key []byte, endkey []byte)
+	Size() int
+	Close()
 }
 
-// keyFunc returns the key of an request, which is used to look up in the cache for it's caching response.
+// keyFunc returns the key of a request, which is used to look up its caching response in the cache.
 func keyFunc(req *pb.RangeRequest) string {
 	// TODO: use marshalTo to reduce allocation
 	b, err := req.Marshal()
@@ -51,10 +57,16 @@ func NewCache(maxCacheEntries int) Cache {
 	}
 }
 
+func (c *cache) Close() {}
+
 // cache implements Cache
 type cache struct {
-	mu           sync.RWMutex
-	lru          *lru.Cache
+	mu  sync.RWMutex
+	lru *lru.Cache
+
+	// a reverse index for cache invalidation
+	cachedRanges adt.IntervalTree
+
 	compactedRev int64
 }
 
@@ -68,6 +80,29 @@ func (c *cache) Add(req *pb.RangeRequest, resp *pb.RangeResponse) {
 	if req.Revision > c.compactedRev {
 		c.lru.Add(key, resp)
 	}
+	// we do not need to invalidate a request with a revision specified.
+	// so we do not need to add it into the reverse index.
+	if req.Revision != 0 {
+		return
+	}
+
+	var (
+		iv  *adt.IntervalValue
+		ivl adt.Interval
+	)
+	if len(req.RangeEnd) != 0 {
+		ivl = adt.NewStringAffineInterval(string(req.Key), string(req.RangeEnd))
+	} else {
+		ivl = adt.NewStringAffinePoint(string(req.Key))
+	}
+
+	iv = c.cachedRanges.Find(ivl)
+
+	if iv == nil {
+		c.cachedRanges.Insert(ivl, []string{key})
+	} else {
+		iv.Val = append(iv.Val.([]string), key)
+	}
 }
 
 // Get looks up the caching response for a given request.
@@ -78,7 +113,7 @@ func (c *cache) Get(req *pb.RangeRequest) (*pb.RangeResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if req.Revision < c.compactedRev {
+	if req.Revision > 0 && req.Revision < c.compactedRev {
 		c.lru.Remove(key)
 		return nil, ErrCompacted
 	}
@@ -87,6 +122,32 @@ func (c *cache) Get(req *pb.RangeRequest) (*pb.RangeResponse, error) {
 		return resp.(*pb.RangeResponse), nil
 	}
 	return nil, errors.New("not exist")
+}
+
+// Invalidate invalidates the cache entries that intersecting with the given range from key to endkey.
+func (c *cache) Invalidate(key, endkey []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var (
+		ivs []*adt.IntervalValue
+		ivl adt.Interval
+	)
+	if len(endkey) == 0 {
+		ivl = adt.NewStringAffinePoint(string(key))
+	} else {
+		ivl = adt.NewStringAffineInterval(string(key), string(endkey))
+	}
+
+	ivs = c.cachedRanges.Stab(ivl)
+	for _, iv := range ivs {
+		keys := iv.Val.([]string)
+		for _, key := range keys {
+			c.lru.Remove(key)
+		}
+	}
+	// delete after removing all keys since it is destructive to 'ivs'
+	c.cachedRanges.Delete(ivl)
 }
 
 // Compact invalidate all caching response before the given rev.
@@ -98,4 +159,10 @@ func (c *cache) Compact(revision int64) {
 	if revision > c.compactedRev {
 		c.compactedRev = revision
 	}
+}
+
+func (c *cache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lru.Len()
 }

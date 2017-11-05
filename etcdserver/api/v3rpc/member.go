@@ -15,6 +15,7 @@
 package v3rpc
 
 import (
+	"context"
 	"time"
 
 	"github.com/coreos/etcd/etcdserver"
@@ -23,22 +24,17 @@ import (
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/etcdserver/membership"
 	"github.com/coreos/etcd/pkg/types"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 )
 
 type ClusterServer struct {
-	cluster   api.Cluster
-	server    etcdserver.Server
-	raftTimer etcdserver.RaftTimer
+	cluster api.Cluster
+	server  etcdserver.ServerV3
 }
 
-func NewClusterServer(s *etcdserver.EtcdServer) *ClusterServer {
+func NewClusterServer(s etcdserver.ServerV3) *ClusterServer {
 	return &ClusterServer{
-		cluster:   s.Cluster(),
-		server:    s,
-		raftTimer: s,
+		cluster: s.Cluster(),
+		server:  s,
 	}
 }
 
@@ -50,34 +46,24 @@ func (cs *ClusterServer) MemberAdd(ctx context.Context, r *pb.MemberAddRequest) 
 
 	now := time.Now()
 	m := membership.NewMember("", urls, "", &now)
-	err = cs.server.AddMember(ctx, *m)
-	switch {
-	case err == membership.ErrIDExists:
-		return nil, rpctypes.ErrGRPCMemberExist
-	case err == membership.ErrPeerURLexists:
-		return nil, rpctypes.ErrGRPCPeerURLExist
-	case err != nil:
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+	membs, merr := cs.server.AddMember(ctx, *m)
+	if merr != nil {
+		return nil, togRPCError(merr)
 	}
 
 	return &pb.MemberAddResponse{
-		Header: cs.header(),
-		Member: &pb.Member{ID: uint64(m.ID), PeerURLs: m.PeerURLs},
+		Header:  cs.header(),
+		Member:  &pb.Member{ID: uint64(m.ID), PeerURLs: m.PeerURLs},
+		Members: membersToProtoMembers(membs),
 	}, nil
 }
 
 func (cs *ClusterServer) MemberRemove(ctx context.Context, r *pb.MemberRemoveRequest) (*pb.MemberRemoveResponse, error) {
-	err := cs.server.RemoveMember(ctx, r.ID)
-	switch {
-	case err == membership.ErrIDRemoved:
-		fallthrough
-	case err == membership.ErrIDNotFound:
-		return nil, rpctypes.ErrGRPCMemberNotFound
-	case err != nil:
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+	membs, err := cs.server.RemoveMember(ctx, r.ID)
+	if err != nil {
+		return nil, togRPCError(err)
 	}
-
-	return &pb.MemberRemoveResponse{Header: cs.header()}, nil
+	return &pb.MemberRemoveResponse{Header: cs.header(), Members: membersToProtoMembers(membs)}, nil
 }
 
 func (cs *ClusterServer) MemberUpdate(ctx context.Context, r *pb.MemberUpdateRequest) (*pb.MemberUpdateResponse, error) {
@@ -85,22 +71,23 @@ func (cs *ClusterServer) MemberUpdate(ctx context.Context, r *pb.MemberUpdateReq
 		ID:             types.ID(r.ID),
 		RaftAttributes: membership.RaftAttributes{PeerURLs: r.PeerURLs},
 	}
-	err := cs.server.UpdateMember(ctx, m)
-	switch {
-	case err == membership.ErrPeerURLexists:
-		return nil, rpctypes.ErrGRPCPeerURLExist
-	case err == membership.ErrIDNotFound:
-		return nil, rpctypes.ErrGRPCMemberNotFound
-	case err != nil:
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+	membs, err := cs.server.UpdateMember(ctx, m)
+	if err != nil {
+		return nil, togRPCError(err)
 	}
-
-	return &pb.MemberUpdateResponse{Header: cs.header()}, nil
+	return &pb.MemberUpdateResponse{Header: cs.header(), Members: membersToProtoMembers(membs)}, nil
 }
 
 func (cs *ClusterServer) MemberList(ctx context.Context, r *pb.MemberListRequest) (*pb.MemberListResponse, error) {
-	membs := cs.cluster.Members()
+	membs := membersToProtoMembers(cs.cluster.Members())
+	return &pb.MemberListResponse{Header: cs.header(), Members: membs}, nil
+}
 
+func (cs *ClusterServer) header() *pb.ResponseHeader {
+	return &pb.ResponseHeader{ClusterId: uint64(cs.cluster.ID()), MemberId: uint64(cs.server.ID()), RaftTerm: cs.server.Term()}
+}
+
+func membersToProtoMembers(membs []*membership.Member) []*pb.Member {
 	protoMembs := make([]*pb.Member, len(membs))
 	for i := range membs {
 		protoMembs[i] = &pb.Member{
@@ -110,10 +97,5 @@ func (cs *ClusterServer) MemberList(ctx context.Context, r *pb.MemberListRequest
 			ClientURLs: membs[i].ClientURLs,
 		}
 	}
-
-	return &pb.MemberListResponse{Header: cs.header(), Members: protoMembs}, nil
-}
-
-func (cs *ClusterServer) header() *pb.ResponseHeader {
-	return &pb.ResponseHeader{ClusterId: uint64(cs.cluster.ID()), MemberId: uint64(cs.server.ID()), RaftTerm: cs.raftTimer.Term()}
+	return protoMembs
 }

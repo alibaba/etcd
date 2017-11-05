@@ -28,7 +28,7 @@
 // Make sure to close the client after using it. If the client is not closed, the
 // connection will have leaky goroutines.
 //
-// To specify client request timeout, pass context.WithTimeout to APIs:
+// To specify a client request timeout, wrap the context with context.WithTimeout:
 //
 //	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 //	resp, err := kvc.Put(ctx, "sample_key", "sample_value")
@@ -44,7 +44,7 @@
 // etcd client returns 2 types of errors:
 //
 //	1. context error: canceled or deadline exceeded.
-//	2. gRPC error: see https://github.com/coreos/etcd/blob/master/etcdserver/api/v3rpc/error.go.
+//	2. gRPC error: see https://github.com/coreos/etcd/blob/master/etcdserver/api/v3rpc/rpctypes/error.go
 //
 // Here is the example code to handle client errors:
 //

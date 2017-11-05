@@ -15,6 +15,7 @@
 package mvcc
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 
@@ -99,6 +100,12 @@ type watchStream struct {
 // Watch creates a new watcher in the stream and returns its WatchID.
 // TODO: return error if ws is closed?
 func (ws *watchStream) Watch(key, end []byte, startRev int64, fcs ...FilterFunc) WatchID {
+	// prevent wrong range where key >= end lexicographically
+	// watch request with 'WithFromKey' has empty-byte range end
+	if len(end) != 0 && bytes.Compare(key, end) != -1 {
+		return -1
+	}
+
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	if ws.closed {
@@ -122,16 +129,25 @@ func (ws *watchStream) Chan() <-chan WatchResponse {
 func (ws *watchStream) Cancel(id WatchID) error {
 	ws.mu.Lock()
 	cancel, ok := ws.cancels[id]
+	w := ws.watchers[id]
 	ok = ok && !ws.closed
-	if ok {
-		delete(ws.cancels, id)
-		delete(ws.watchers, id)
-	}
 	ws.mu.Unlock()
+
 	if !ok {
 		return ErrWatcherNotExist
 	}
 	cancel()
+
+	ws.mu.Lock()
+	// The watch isn't removed until cancel so that if Close() is called,
+	// it will wait for the cancel. Otherwise, Close() could close the
+	// watch channel while the store is still posting events.
+	if ww := ws.watchers[id]; ww == w {
+		delete(ws.cancels, id)
+		delete(ws.watchers, id)
+	}
+	ws.mu.Unlock()
+
 	return nil
 }
 

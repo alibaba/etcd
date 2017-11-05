@@ -30,12 +30,10 @@ import (
 // TestTransportSend tests that transport can send messages using correct
 // underlying peer, and drop local or unknown-target messages.
 func TestTransportSend(t *testing.T) {
-	ss := &stats.ServerStats{}
-	ss.Initialize()
 	peer1 := newFakePeer()
 	peer2 := newFakePeer()
 	tr := &Transport{
-		ServerStats: ss,
+		ServerStats: stats.NewServerStats("", ""),
 		peers:       map[types.ID]Peer{types.ID(1): peer1, types.ID(2): peer2},
 	}
 	wmsgsIgnored := []raftpb.Message{
@@ -63,6 +61,35 @@ func TestTransportSend(t *testing.T) {
 	}
 	if !reflect.DeepEqual(peer2.msgs, wmsgsTo2) {
 		t.Errorf("msgs to peer 2 = %+v, want %+v", peer2.msgs, wmsgsTo2)
+	}
+}
+
+func TestTransportCutMend(t *testing.T) {
+	peer1 := newFakePeer()
+	peer2 := newFakePeer()
+	tr := &Transport{
+		ServerStats: stats.NewServerStats("", ""),
+		peers:       map[types.ID]Peer{types.ID(1): peer1, types.ID(2): peer2},
+	}
+
+	tr.CutPeer(types.ID(1))
+
+	wmsgsTo := []raftpb.Message{
+		// good message
+		{Type: raftpb.MsgProp, To: 1},
+		{Type: raftpb.MsgApp, To: 1},
+	}
+
+	tr.Send(wmsgsTo)
+	if len(peer1.msgs) > 0 {
+		t.Fatalf("msgs expected to be ignored, got %+v", peer1.msgs)
+	}
+
+	tr.MendPeer(types.ID(1))
+
+	tr.Send(wmsgsTo)
+	if !reflect.DeepEqual(peer1.msgs, wmsgsTo) {
+		t.Errorf("msgs to peer 1 = %+v, want %+v", peer1.msgs, wmsgsTo)
 	}
 }
 

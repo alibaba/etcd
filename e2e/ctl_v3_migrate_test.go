@@ -15,12 +15,11 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/pkg/testutil"
@@ -29,7 +28,7 @@ import (
 func TestCtlV3Migrate(t *testing.T) {
 	defer testutil.AfterTest(t)
 
-	epc := setupEtcdctlTest(t, &configNoTLS, true)
+	epc := setupEtcdctlTest(t, &configNoTLS, false)
 	defer func() {
 		if errC := epc.Close(); errC != nil {
 			t.Fatalf("error closing etcd processes (%v)", errC)
@@ -48,11 +47,8 @@ func TestCtlV3Migrate(t *testing.T) {
 		}
 	}
 
-	dataDirs := make([]string, len(epc.procs))
-	for i := range epc.procs {
-		dataDirs[i] = epc.procs[i].cfg.dataDirPath
-	}
-	if err := epc.StopAll(); err != nil {
+	dataDir := epc.procs[0].Config().dataDirPath
+	if err := epc.Stop(); err != nil {
 		t.Fatalf("error closing etcd processes (%v)", err)
 	}
 
@@ -62,19 +58,14 @@ func TestCtlV3Migrate(t *testing.T) {
 		t:           t,
 		cfg:         configNoTLS,
 		dialTimeout: 7 * time.Second,
-		quorum:      true,
 		epc:         epc,
 	}
-	for i := range dataDirs {
-		if err := ctlV3Migrate(cx, dataDirs[i], ""); err != nil {
-			t.Fatal(err)
-		}
+	if err := ctlV3Migrate(cx, dataDir, ""); err != nil {
+		t.Fatal(err)
 	}
 
-	for i := range epc.procs {
-		epc.procs[i].cfg.keepDataDir = true
-	}
-	if err := epc.RestartAll(); err != nil {
+	epc.procs[0].Config().keepDataDir = true
+	if err := epc.Restart(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,7 +74,7 @@ func TestCtlV3Migrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   epc.grpcEndpoints(),
+		Endpoints:   epc.EndpointsV3(),
 		DialTimeout: 3 * time.Second,
 	})
 	if err != nil {
@@ -97,8 +88,8 @@ func TestCtlV3Migrate(t *testing.T) {
 	if len(resp.Kvs) != 1 {
 		t.Fatalf("len(resp.Kvs) expected 1, got %+v", resp.Kvs)
 	}
-	if resp.Kvs[0].CreateRevision != 4 {
-		t.Fatalf("resp.Kvs[0].CreateRevision expected 4, got %d", resp.Kvs[0].CreateRevision)
+	if resp.Kvs[0].CreateRevision != 7 {
+		t.Fatalf("resp.Kvs[0].CreateRevision expected 7, got %d", resp.Kvs[0].CreateRevision)
 	}
 }
 

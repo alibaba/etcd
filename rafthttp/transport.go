@@ -15,6 +15,7 @@
 package rafthttp
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -26,9 +27,10 @@ import (
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/snap"
+
 	"github.com/coreos/pkg/capnslog"
 	"github.com/xiang90/probing"
-	"golang.org/x/net/context"
+	"golang.org/x/time/rate"
 )
 
 var plog = logutil.NewMergeLogger(capnslog.NewPackageLogger("github.com/coreos/etcd", "rafthttp"))
@@ -94,8 +96,12 @@ type Transporter interface {
 // User needs to call Start before calling other functions, and call
 // Stop when the Transport is no longer used.
 type Transport struct {
-	DialTimeout time.Duration     // maximum duration before timing out dial of the request
-	TLSInfo     transport.TLSInfo // TLS information used when creating connection
+	DialTimeout time.Duration // maximum duration before timing out dial of the request
+	// DialRetryFrequency defines the frequency of streamReader dial retrial attempts;
+	// a distinct rate limiter is created per every peer (default value: 10 events/sec)
+	DialRetryFrequency rate.Limit
+
+	TLSInfo transport.TLSInfo // TLS information used when creating connection
 
 	ID          types.ID   // local member ID
 	URLs        types.URLs // local peer URLs
@@ -135,6 +141,13 @@ func (t *Transport) Start() error {
 	t.remotes = make(map[types.ID]*remote)
 	t.peers = make(map[types.ID]Peer)
 	t.prober = probing.NewProber(t.pipelineRt)
+
+	// If client didn't provide dial retry frequency, use the default
+	// (100ms backoff between attempts to create a new stream),
+	// so it doesn't bring too much overhead when retry.
+	if t.DialRetryFrequency == 0 {
+		t.DialRetryFrequency = rate.Every(100 * time.Millisecond)
+	}
 	return nil
 }
 
@@ -204,6 +217,36 @@ func (t *Transport) Stop() {
 	}
 	t.peers = nil
 	t.remotes = nil
+}
+
+// CutPeer drops messages to the specified peer.
+func (t *Transport) CutPeer(id types.ID) {
+	t.mu.RLock()
+	p, pok := t.peers[id]
+	g, gok := t.remotes[id]
+	t.mu.RUnlock()
+
+	if pok {
+		p.(Pausable).Pause()
+	}
+	if gok {
+		g.Pause()
+	}
+}
+
+// MendPeer recovers the message dropping behavior of the given peer.
+func (t *Transport) MendPeer(id types.ID) {
+	t.mu.RLock()
+	p, pok := t.peers[id]
+	g, gok := t.remotes[id]
+	t.mu.RUnlock()
+
+	if pok {
+		p.(Pausable).Resume()
+	}
+	if gok {
+		g.Resume()
+	}
 }
 
 func (t *Transport) AddRemote(id types.ID, us []string) {

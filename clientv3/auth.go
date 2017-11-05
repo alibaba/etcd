@@ -15,12 +15,13 @@
 package clientv3
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/coreos/etcd/auth/authpb"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"golang.org/x/net/context"
+
 	"google.golang.org/grpc"
 )
 
@@ -43,6 +44,7 @@ type (
 	AuthRoleListResponse             pb.AuthRoleListResponse
 
 	PermissionType authpb.Permission_Type
+	Permission     authpb.Permission
 )
 
 const (
@@ -99,68 +101,60 @@ type Auth interface {
 }
 
 type auth struct {
-	c *Client
-
-	conn   *grpc.ClientConn // conn in-use
 	remote pb.AuthClient
 }
 
 func NewAuth(c *Client) Auth {
-	conn := c.ActiveConnection()
-	return &auth{
-		conn:   c.ActiveConnection(),
-		remote: pb.NewAuthClient(conn),
-		c:      c,
-	}
+	return &auth{remote: RetryAuthClient(c)}
 }
 
 func (auth *auth) AuthEnable(ctx context.Context) (*AuthEnableResponse, error) {
-	resp, err := auth.remote.AuthEnable(ctx, &pb.AuthEnableRequest{}, grpc.FailFast(false))
+	resp, err := auth.remote.AuthEnable(ctx, &pb.AuthEnableRequest{})
 	return (*AuthEnableResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) AuthDisable(ctx context.Context) (*AuthDisableResponse, error) {
-	resp, err := auth.remote.AuthDisable(ctx, &pb.AuthDisableRequest{}, grpc.FailFast(false))
+	resp, err := auth.remote.AuthDisable(ctx, &pb.AuthDisableRequest{})
 	return (*AuthDisableResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserAdd(ctx context.Context, name string, password string) (*AuthUserAddResponse, error) {
-	resp, err := auth.remote.UserAdd(ctx, &pb.AuthUserAddRequest{Name: name, Password: password}, grpc.FailFast(false))
+	resp, err := auth.remote.UserAdd(ctx, &pb.AuthUserAddRequest{Name: name, Password: password})
 	return (*AuthUserAddResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserDelete(ctx context.Context, name string) (*AuthUserDeleteResponse, error) {
-	resp, err := auth.remote.UserDelete(ctx, &pb.AuthUserDeleteRequest{Name: name}, grpc.FailFast(false))
+	resp, err := auth.remote.UserDelete(ctx, &pb.AuthUserDeleteRequest{Name: name})
 	return (*AuthUserDeleteResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserChangePassword(ctx context.Context, name string, password string) (*AuthUserChangePasswordResponse, error) {
-	resp, err := auth.remote.UserChangePassword(ctx, &pb.AuthUserChangePasswordRequest{Name: name, Password: password}, grpc.FailFast(false))
+	resp, err := auth.remote.UserChangePassword(ctx, &pb.AuthUserChangePasswordRequest{Name: name, Password: password})
 	return (*AuthUserChangePasswordResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserGrantRole(ctx context.Context, user string, role string) (*AuthUserGrantRoleResponse, error) {
-	resp, err := auth.remote.UserGrantRole(ctx, &pb.AuthUserGrantRoleRequest{User: user, Role: role}, grpc.FailFast(false))
+	resp, err := auth.remote.UserGrantRole(ctx, &pb.AuthUserGrantRoleRequest{User: user, Role: role})
 	return (*AuthUserGrantRoleResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserGet(ctx context.Context, name string) (*AuthUserGetResponse, error) {
-	resp, err := auth.remote.UserGet(ctx, &pb.AuthUserGetRequest{Name: name}, grpc.FailFast(false))
+	resp, err := auth.remote.UserGet(ctx, &pb.AuthUserGetRequest{Name: name})
 	return (*AuthUserGetResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserList(ctx context.Context) (*AuthUserListResponse, error) {
-	resp, err := auth.remote.UserList(ctx, &pb.AuthUserListRequest{}, grpc.FailFast(false))
+	resp, err := auth.remote.UserList(ctx, &pb.AuthUserListRequest{})
 	return (*AuthUserListResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) UserRevokeRole(ctx context.Context, name string, role string) (*AuthUserRevokeRoleResponse, error) {
-	resp, err := auth.remote.UserRevokeRole(ctx, &pb.AuthUserRevokeRoleRequest{Name: name, Role: role}, grpc.FailFast(false))
+	resp, err := auth.remote.UserRevokeRole(ctx, &pb.AuthUserRevokeRoleRequest{Name: name, Role: role})
 	return (*AuthUserRevokeRoleResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) RoleAdd(ctx context.Context, name string) (*AuthRoleAddResponse, error) {
-	resp, err := auth.remote.RoleAdd(ctx, &pb.AuthRoleAddRequest{Name: name}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleAdd(ctx, &pb.AuthRoleAddRequest{Name: name})
 	return (*AuthRoleAddResponse)(resp), toErr(ctx, err)
 }
 
@@ -170,27 +164,27 @@ func (auth *auth) RoleGrantPermission(ctx context.Context, name string, key, ran
 		RangeEnd: []byte(rangeEnd),
 		PermType: authpb.Permission_Type(permType),
 	}
-	resp, err := auth.remote.RoleGrantPermission(ctx, &pb.AuthRoleGrantPermissionRequest{Name: name, Perm: perm}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleGrantPermission(ctx, &pb.AuthRoleGrantPermissionRequest{Name: name, Perm: perm})
 	return (*AuthRoleGrantPermissionResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) RoleGet(ctx context.Context, role string) (*AuthRoleGetResponse, error) {
-	resp, err := auth.remote.RoleGet(ctx, &pb.AuthRoleGetRequest{Role: role}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleGet(ctx, &pb.AuthRoleGetRequest{Role: role})
 	return (*AuthRoleGetResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) RoleList(ctx context.Context) (*AuthRoleListResponse, error) {
-	resp, err := auth.remote.RoleList(ctx, &pb.AuthRoleListRequest{}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleList(ctx, &pb.AuthRoleListRequest{})
 	return (*AuthRoleListResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) RoleRevokePermission(ctx context.Context, role string, key, rangeEnd string) (*AuthRoleRevokePermissionResponse, error) {
-	resp, err := auth.remote.RoleRevokePermission(ctx, &pb.AuthRoleRevokePermissionRequest{Role: role, Key: key, RangeEnd: rangeEnd}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleRevokePermission(ctx, &pb.AuthRoleRevokePermissionRequest{Role: role, Key: key, RangeEnd: rangeEnd})
 	return (*AuthRoleRevokePermissionResponse)(resp), toErr(ctx, err)
 }
 
 func (auth *auth) RoleDelete(ctx context.Context, role string) (*AuthRoleDeleteResponse, error) {
-	resp, err := auth.remote.RoleDelete(ctx, &pb.AuthRoleDeleteRequest{Role: role}, grpc.FailFast(false))
+	resp, err := auth.remote.RoleDelete(ctx, &pb.AuthRoleDeleteRequest{Role: role})
 	return (*AuthRoleDeleteResponse)(resp), toErr(ctx, err)
 }
 
@@ -208,7 +202,7 @@ type authenticator struct {
 }
 
 func (auth *authenticator) authenticate(ctx context.Context, name string, password string) (*AuthenticateResponse, error) {
-	resp, err := auth.remote.Authenticate(ctx, &pb.AuthenticateRequest{Name: name, Password: password}, grpc.FailFast(false))
+	resp, err := auth.remote.Authenticate(ctx, &pb.AuthenticateRequest{Name: name, Password: password})
 	return (*AuthenticateResponse)(resp), toErr(ctx, err)
 }
 

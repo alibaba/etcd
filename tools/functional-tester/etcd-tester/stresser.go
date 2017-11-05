@@ -16,241 +16,203 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
-	"net"
-	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
-	clientV2 "github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
-	"google.golang.org/grpc/transport"
 )
 
-func init() {
-	grpclog.SetLogger(plog)
-}
+func init() { grpclog.SetLoggerV2(grpclog.NewLoggerV2(os.Stderr, os.Stderr, os.Stderr)) }
 
 type Stresser interface {
 	// Stress starts to stress the etcd cluster
 	Stress() error
-	// Cancel cancels the stress test on the etcd cluster
-	Cancel()
-	// Report reports the success and failure of the stress test
-	Report() (success int, failure int)
+	// Pause stops the stresser from sending requests to etcd. Resume by calling Stress.
+	Pause()
+	// Close releases all of the Stresser's resources.
+	Close()
+	// ModifiedKeys reports the number of keys created and deleted by stresser
+	ModifiedKeys() int64
+	// Checker returns an invariant checker for after the stresser is canceled.
+	Checker() Checker
 }
 
-type stresser struct {
-	Endpoint string
+// nopStresser implements Stresser that does nothing
+type nopStresser struct {
+	start time.Time
+	qps   int
+}
 
-	KeySize        int
-	KeySuffixRange int
+func (s *nopStresser) Stress() error { return nil }
+func (s *nopStresser) Pause()        {}
+func (s *nopStresser) Close()        {}
+func (s *nopStresser) ModifiedKeys() int64 {
+	return 0
+}
+func (s *nopStresser) Checker() Checker { return nil }
 
-	qps int
-	N   int
+// compositeStresser implements a Stresser that runs a slice of
+// stressers concurrently.
+type compositeStresser struct {
+	stressers []Stresser
+}
 
-	mu sync.Mutex
-	wg *sync.WaitGroup
+func (cs *compositeStresser) Stress() error {
+	for i, s := range cs.stressers {
+		if err := s.Stress(); err != nil {
+			for j := 0; j < i; j++ {
+				cs.stressers[i].Close()
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (cs *compositeStresser) Pause() {
+	var wg sync.WaitGroup
+	wg.Add(len(cs.stressers))
+	for i := range cs.stressers {
+		go func(s Stresser) {
+			defer wg.Done()
+			s.Pause()
+		}(cs.stressers[i])
+	}
+	wg.Wait()
+}
+
+func (cs *compositeStresser) Close() {
+	var wg sync.WaitGroup
+	wg.Add(len(cs.stressers))
+	for i := range cs.stressers {
+		go func(s Stresser) {
+			defer wg.Done()
+			s.Close()
+		}(cs.stressers[i])
+	}
+	wg.Wait()
+}
+
+func (cs *compositeStresser) ModifiedKeys() (modifiedKey int64) {
+	for _, stress := range cs.stressers {
+		modifiedKey += stress.ModifiedKeys()
+	}
+	return modifiedKey
+}
+
+func (cs *compositeStresser) Checker() Checker {
+	var chks []Checker
+	for _, s := range cs.stressers {
+		if chk := s.Checker(); chk != nil {
+			chks = append(chks, chk)
+		}
+	}
+	if len(chks) == 0 {
+		return nil
+	}
+	return newCompositeChecker(chks)
+}
+
+type stressConfig struct {
+	keyLargeSize   int
+	keySize        int
+	keySuffixRange int
+
+	numLeases    int
+	keysPerLease int
 
 	rateLimiter *rate.Limiter
 
-	cancel func()
-	conn   *grpc.ClientConn
-
-	success int
+	etcdRunnerPath string
 }
 
-func (s *stresser) Stress() error {
-	// TODO: add backoff option
-	conn, err := grpc.Dial(s.Endpoint, grpc.WithInsecure())
-	if err != nil {
-		return fmt.Errorf("%v (%s)", err, s.Endpoint)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-
-	wg := &sync.WaitGroup{}
-	wg.Add(s.N)
-
-	s.mu.Lock()
-	s.conn = conn
-	s.cancel = cancel
-	s.wg = wg
-	s.rateLimiter = rate.NewLimiter(rate.Every(time.Second), s.qps)
-	s.mu.Unlock()
-
-	kvc := pb.NewKVClient(conn)
-
-	for i := 0; i < s.N; i++ {
-		go s.run(ctx, kvc)
-	}
-
-	plog.Printf("stresser %q is started", s.Endpoint)
-	return nil
-}
-
-func (s *stresser) run(ctx context.Context, kvc pb.KVClient) {
-	defer s.wg.Done()
-
-	for {
-		if err := s.rateLimiter.Wait(ctx); err == context.Canceled {
-			return
+// NewStresser creates stresser from a comma separated list of stresser types.
+func NewStresser(s string, sc *stressConfig, m *member) Stresser {
+	types := strings.Split(s, ",")
+	if len(types) > 1 {
+		stressers := make([]Stresser, len(types))
+		for i, stype := range types {
+			stressers[i] = NewStresser(stype, sc, m)
 		}
-
-		// TODO: 10-second is enough timeout to cover leader failure
-		// and immediate leader election. Find out what other cases this
-		// could be timed out.
-		putctx, putcancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := kvc.Put(putctx, &pb.PutRequest{
-			Key:   []byte(fmt.Sprintf("foo%d", rand.Intn(s.KeySuffixRange))),
-			Value: []byte(randStr(s.KeySize)),
-		},
-			grpc.FailFast(false))
-		putcancel()
-		if err != nil {
-			shouldContinue := false
-			switch grpc.ErrorDesc(err) {
-			case context.DeadlineExceeded.Error():
-				// This retries when request is triggered at the same time as
-				// leader failure. When we terminate the leader, the request to
-				// that leader cannot be processed, and times out. Also requests
-				// to followers cannot be forwarded to the old leader, so timing out
-				// as well. We want to keep stressing until the cluster elects a
-				// new leader and start processing requests again.
-				shouldContinue = true
-
-			case etcdserver.ErrTimeoutDueToLeaderFail.Error(), etcdserver.ErrTimeout.Error():
-				// This retries when request is triggered at the same time as
-				// leader failure and follower nodes receive time out errors
-				// from losing their leader. Followers should retry to connect
-				// to the new leader.
-				shouldContinue = true
-
-			case etcdserver.ErrStopped.Error():
-				// one of the etcd nodes stopped from failure injection
-				shouldContinue = true
-
-			case transport.ErrConnClosing.Desc:
-				// server closed the transport (failure injected node)
-				shouldContinue = true
-
-			case rpctypes.ErrNotCapable.Error():
-				// capability check has not been done (in the beginning)
-				shouldContinue = true
-
-				// default:
-				// errors from stresser.Cancel method:
-				// rpc error: code = 1 desc = context canceled (type grpc.rpcError)
-				// rpc error: code = 2 desc = grpc: the client connection is closing (type grpc.rpcError)
-			}
-			if shouldContinue {
-				continue
-			}
-			return
+		return &compositeStresser{stressers}
+	}
+	switch s {
+	case "nop":
+		return &nopStresser{start: time.Now(), qps: int(sc.rateLimiter.Limit())}
+	case "keys":
+		// TODO: Too intensive stressers can panic etcd member with
+		// 'out of memory' error. Put rate limits in server side.
+		return &keyStresser{
+			Endpoint:       m.grpcAddr(),
+			keyLargeSize:   sc.keyLargeSize,
+			keySize:        sc.keySize,
+			keySuffixRange: sc.keySuffixRange,
+			N:              100,
+			rateLimiter:    sc.rateLimiter,
 		}
-		s.mu.Lock()
-		s.success++
-		s.mu.Unlock()
+	case "v2keys":
+		return &v2Stresser{
+			Endpoint:       m.ClientURL,
+			keySize:        sc.keySize,
+			keySuffixRange: sc.keySuffixRange,
+			N:              100,
+			rateLimiter:    sc.rateLimiter,
+		}
+	case "lease":
+		return &leaseStresser{
+			endpoint:     m.grpcAddr(),
+			numLeases:    sc.numLeases,
+			keysPerLease: sc.keysPerLease,
+			rateLimiter:  sc.rateLimiter,
+		}
+	case "election-runner":
+		reqRate := 100
+		args := []string{
+			"election",
+			fmt.Sprintf("%v", time.Now().UnixNano()), // election name as current nano time
+			"--dial-timeout=10s",
+			"--endpoints", m.grpcAddr(),
+			"--total-client-connections=10",
+			"--rounds=0", // runs forever
+			"--req-rate", fmt.Sprintf("%v", reqRate),
+		}
+		return newRunnerStresser(sc.etcdRunnerPath, args, sc.rateLimiter, reqRate)
+	case "watch-runner":
+		reqRate := 100
+		args := []string{
+			"watcher",
+			"--prefix", fmt.Sprintf("%v", time.Now().UnixNano()), // prefix all keys with nano time
+			"--total-keys=1",
+			"--total-prefixes=1",
+			"--watch-per-prefix=1",
+			"--endpoints", m.grpcAddr(),
+			"--rounds=0", // runs forever
+			"--req-rate", fmt.Sprintf("%v", reqRate),
+		}
+		return newRunnerStresser(sc.etcdRunnerPath, args, sc.rateLimiter, reqRate)
+	case "lock-racer-runner":
+		reqRate := 100
+		args := []string{
+			"lock-racer",
+			fmt.Sprintf("%v", time.Now().UnixNano()), // locker name as current nano time
+			"--endpoints", m.grpcAddr(),
+			"--total-client-connections=10",
+			"--rounds=0", // runs forever
+			"--req-rate", fmt.Sprintf("%v", reqRate),
+		}
+		return newRunnerStresser(sc.etcdRunnerPath, args, sc.rateLimiter, reqRate)
+	case "lease-runner":
+		args := []string{
+			"lease-renewer",
+			"--ttl=30",
+			"--endpoints", m.grpcAddr(),
+		}
+		return newRunnerStresser(sc.etcdRunnerPath, args, sc.rateLimiter, 0)
+	default:
+		plog.Panicf("unknown stresser type: %s\n", s)
 	}
-}
-
-func (s *stresser) Cancel() {
-	s.mu.Lock()
-	s.cancel()
-	s.conn.Close()
-	wg := s.wg
-	s.mu.Unlock()
-
-	wg.Wait()
-	plog.Printf("stresser %q is canceled", s.Endpoint)
-}
-
-func (s *stresser) Report() (int, int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// TODO: find a better way to report v3 tests
-	return s.success, -1
-}
-
-type stresserV2 struct {
-	Endpoint string
-
-	KeySize        int
-	KeySuffixRange int
-
-	N int
-
-	mu      sync.Mutex
-	failure int
-	success int
-
-	cancel func()
-}
-
-func (s *stresserV2) Stress() error {
-	cfg := clientV2.Config{
-		Endpoints: []string{s.Endpoint},
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout:   time.Second,
-				KeepAlive: 30 * time.Second,
-			}).Dial,
-			MaxIdleConnsPerHost: s.N,
-		},
-	}
-	c, err := clientV2.New(cfg)
-	if err != nil {
-		return err
-	}
-
-	kv := clientV2.NewKeysAPI(c)
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-
-	for i := 0; i < s.N; i++ {
-		go func() {
-			for {
-				setctx, setcancel := context.WithTimeout(ctx, clientV2.DefaultRequestTimeout)
-				key := fmt.Sprintf("foo%d", rand.Intn(s.KeySuffixRange))
-				_, err := kv.Set(setctx, key, randStr(s.KeySize), nil)
-				setcancel()
-				if err == context.Canceled {
-					return
-				}
-				s.mu.Lock()
-				if err != nil {
-					s.failure++
-				} else {
-					s.success++
-				}
-				s.mu.Unlock()
-			}
-		}()
-	}
-
-	<-ctx.Done()
-	return nil
-}
-
-func (s *stresserV2) Cancel() {
-	s.cancel()
-}
-
-func (s *stresserV2) Report() (success int, failure int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.success, s.failure
-}
-
-func randStr(size int) string {
-	data := make([]byte, size)
-	for i := 0; i < size; i++ {
-		data[i] = byte(int('a') + rand.Intn(26))
-	}
-	return string(data)
+	return nil // never reach here
 }

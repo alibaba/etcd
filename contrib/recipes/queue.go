@@ -15,9 +15,10 @@
 package recipe
 
 import (
+	"context"
+
 	v3 "github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/mvcc/mvccpb"
-	"golang.org/x/net/context"
 )
 
 // Queue implements a multi-reader, multi-writer distributed queue.
@@ -33,7 +34,7 @@ func NewQueue(client *v3.Client, keyPrefix string) *Queue {
 }
 
 func (q *Queue) Enqueue(val string) error {
-	_, err := NewUniqueKV(q.client, q.keyPrefix, val, 0)
+	_, err := newUniqueKV(q.client, q.keyPrefix, val)
 	return err
 }
 

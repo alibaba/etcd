@@ -16,6 +16,7 @@ package v2http
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io/ioutil"
@@ -30,6 +31,7 @@ import (
 
 	etcdErr "github.com/coreos/etcd/error"
 	"github.com/coreos/etcd/etcdserver"
+	"github.com/coreos/etcd/etcdserver/api"
 	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/etcdserver/membership"
@@ -37,10 +39,9 @@ import (
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/store"
-	"github.com/coreos/etcd/version"
+
 	"github.com/coreos/go-semver/semver"
 	"github.com/jonboulle/clockwork"
-	"golang.org/x/net/context"
 )
 
 func mustMarshalEvent(t *testing.T, ev *store.Event) string {
@@ -88,14 +89,26 @@ func mustNewMethodRequest(t *testing.T, m, p string) *http.Request {
 	}
 }
 
+type fakeServer struct {
+	dummyRaftTimer
+	dummyStats
+}
+
+func (s *fakeServer) Leader() types.ID                    { return types.ID(1) }
+func (s *fakeServer) Alarms() []*etcdserverpb.AlarmMember { return nil }
+func (s *fakeServer) Cluster() api.Cluster                { return nil }
+func (s *fakeServer) ClusterVersion() *semver.Version     { return nil }
+func (s *fakeServer) RaftHandler() http.Handler           { return nil }
+func (s *fakeServer) Do(ctx context.Context, r etcdserverpb.Request) (rr etcdserver.Response, err error) {
+	return
+}
+func (s *fakeServer) ClientCertAuthEnabled() bool { return false }
+
 type serverRecorder struct {
+	fakeServer
 	actions []action
 }
 
-func (s *serverRecorder) Start()           {}
-func (s *serverRecorder) Stop()            {}
-func (s *serverRecorder) Leader() types.ID { return types.ID(1) }
-func (s *serverRecorder) ID() types.ID     { return types.ID(1) }
 func (s *serverRecorder) Do(_ context.Context, r etcdserverpb.Request) (etcdserver.Response, error) {
 	s.actions = append(s.actions, action{name: "Do", params: []interface{}{r}})
 	return etcdserver.Response{}, nil
@@ -104,21 +117,19 @@ func (s *serverRecorder) Process(_ context.Context, m raftpb.Message) error {
 	s.actions = append(s.actions, action{name: "Process", params: []interface{}{m}})
 	return nil
 }
-func (s *serverRecorder) AddMember(_ context.Context, m membership.Member) error {
+func (s *serverRecorder) AddMember(_ context.Context, m membership.Member) ([]*membership.Member, error) {
 	s.actions = append(s.actions, action{name: "AddMember", params: []interface{}{m}})
-	return nil
+	return nil, nil
 }
-func (s *serverRecorder) RemoveMember(_ context.Context, id uint64) error {
+func (s *serverRecorder) RemoveMember(_ context.Context, id uint64) ([]*membership.Member, error) {
 	s.actions = append(s.actions, action{name: "RemoveMember", params: []interface{}{id}})
-	return nil
+	return nil, nil
 }
 
-func (s *serverRecorder) UpdateMember(_ context.Context, m membership.Member) error {
+func (s *serverRecorder) UpdateMember(_ context.Context, m membership.Member) ([]*membership.Member, error) {
 	s.actions = append(s.actions, action{name: "UpdateMember", params: []interface{}{m}})
-	return nil
+	return nil, nil
 }
-
-func (s *serverRecorder) ClusterVersion() *semver.Version { return nil }
 
 type action struct {
 	name   string
@@ -139,21 +150,23 @@ func (fr *flushingRecorder) Flush() {
 // resServer implements the etcd.Server interface for testing.
 // It returns the given response from any Do calls, and nil error
 type resServer struct {
+	fakeServer
 	res etcdserver.Response
 }
 
-func (rs *resServer) Start()           {}
-func (rs *resServer) Stop()            {}
-func (rs *resServer) ID() types.ID     { return types.ID(1) }
-func (rs *resServer) Leader() types.ID { return types.ID(1) }
 func (rs *resServer) Do(_ context.Context, _ etcdserverpb.Request) (etcdserver.Response, error) {
 	return rs.res, nil
 }
-func (rs *resServer) Process(_ context.Context, _ raftpb.Message) error         { return nil }
-func (rs *resServer) AddMember(_ context.Context, _ membership.Member) error    { return nil }
-func (rs *resServer) RemoveMember(_ context.Context, _ uint64) error            { return nil }
-func (rs *resServer) UpdateMember(_ context.Context, _ membership.Member) error { return nil }
-func (rs *resServer) ClusterVersion() *semver.Version                           { return nil }
+func (rs *resServer) Process(_ context.Context, _ raftpb.Message) error { return nil }
+func (rs *resServer) AddMember(_ context.Context, _ membership.Member) ([]*membership.Member, error) {
+	return nil, nil
+}
+func (rs *resServer) RemoveMember(_ context.Context, _ uint64) ([]*membership.Member, error) {
+	return nil, nil
+}
+func (rs *resServer) UpdateMember(_ context.Context, _ membership.Member) ([]*membership.Member, error) {
+	return nil, nil
+}
 
 func boolp(b bool) *bool { return &b }
 
@@ -196,7 +209,7 @@ func TestBadRefreshRequest(t *testing.T) {
 		},
 	}
 	for i, tt := range tests {
-		got, err := parseKeyRequest(tt.in, clockwork.NewFakeClock())
+		got, _, err := parseKeyRequest(tt.in, clockwork.NewFakeClock())
 		if err == nil {
 			t.Errorf("#%d: unexpected nil error!", i)
 			continue
@@ -360,7 +373,7 @@ func TestBadParseRequest(t *testing.T) {
 		},
 	}
 	for i, tt := range tests {
-		got, err := parseKeyRequest(tt.in, clockwork.NewFakeClock())
+		got, _, err := parseKeyRequest(tt.in, clockwork.NewFakeClock())
 		if err == nil {
 			t.Errorf("#%d: unexpected nil error!", i)
 			continue
@@ -384,8 +397,9 @@ func TestGoodParseRequest(t *testing.T) {
 	fc := clockwork.NewFakeClock()
 	fc.Advance(1111)
 	tests := []struct {
-		in *http.Request
-		w  etcdserverpb.Request
+		in      *http.Request
+		w       etcdserverpb.Request
+		noValue bool
 	}{
 		{
 			// good prefix, all other values default
@@ -394,6 +408,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Method: "GET",
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// value specified
@@ -407,6 +422,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Val:    "some_value",
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// prevIndex specified
@@ -420,6 +436,7 @@ func TestGoodParseRequest(t *testing.T) {
 				PrevIndex: 98765,
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// recursive specified
@@ -433,6 +450,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Recursive: true,
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// sorted specified
@@ -446,6 +464,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Sorted: true,
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// quorum specified
@@ -459,6 +478,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Quorum: true,
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// wait specified
@@ -468,6 +488,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Wait:   true,
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// empty TTL specified
@@ -477,6 +498,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Path:       path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 				Expiration: 0,
 			},
+			false,
 		},
 		{
 			// non-empty TTL specified
@@ -486,6 +508,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Path:       path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 				Expiration: fc.Now().Add(5678 * time.Second).UnixNano(),
 			},
+			false,
 		},
 		{
 			// zero TTL specified
@@ -495,6 +518,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Path:       path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 				Expiration: fc.Now().UnixNano(),
 			},
+			false,
 		},
 		{
 			// dir specified
@@ -504,6 +528,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Dir:    true,
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// dir specified negatively
@@ -513,6 +538,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Dir:    false,
 				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// prevExist should be non-null if specified
@@ -526,6 +552,7 @@ func TestGoodParseRequest(t *testing.T) {
 				PrevExist: boolp(true),
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		{
 			// prevExist should be non-null if specified
@@ -539,6 +566,7 @@ func TestGoodParseRequest(t *testing.T) {
 				PrevExist: boolp(false),
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		// mix various fields
 		{
@@ -558,6 +586,7 @@ func TestGoodParseRequest(t *testing.T) {
 				Val:       "some value",
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		// query parameters should be used if given
 		{
@@ -571,6 +600,7 @@ func TestGoodParseRequest(t *testing.T) {
 				PrevValue: "woof",
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
 		},
 		// but form values should take precedence over query parameters
 		{
@@ -586,14 +616,33 @@ func TestGoodParseRequest(t *testing.T) {
 				PrevValue: "miaow",
 				Path:      path.Join(etcdserver.StoreKeysPrefix, "/foo"),
 			},
+			false,
+		},
+		{
+			// noValueOnSuccess specified
+			mustNewForm(
+				t,
+				"foo",
+				url.Values{"noValueOnSuccess": []string{"true"}},
+			),
+			etcdserverpb.Request{
+				Method: "PUT",
+				Path:   path.Join(etcdserver.StoreKeysPrefix, "/foo"),
+			},
+			true,
 		},
 	}
 
 	for i, tt := range tests {
-		got, err := parseKeyRequest(tt.in, fc)
+		got, noValueOnSuccess, err := parseKeyRequest(tt.in, fc)
 		if err != nil {
 			t.Errorf("#%d: err = %v, want %v", i, err, nil)
 		}
+
+		if noValueOnSuccess != tt.noValue {
+			t.Errorf("#%d: noValue=%t, want %t", i, noValueOnSuccess, tt.noValue)
+		}
+
 		if !reflect.DeepEqual(got, tt.w) {
 			t.Errorf("#%d: request=%#v, want %#v", i, got, tt.w)
 		}
@@ -736,14 +785,14 @@ func TestServeMembersCreate(t *testing.T) {
 		t.Errorf("cid = %s, want %s", gcid, wcid)
 	}
 
-	wb := `{"id":"2a86a83729b330d5","name":"","peerURLs":["http://127.0.0.1:1"],"clientURLs":[]}` + "\n"
+	wb := `{"id":"c29b431f04be0bc7","name":"","peerURLs":["http://127.0.0.1:1"],"clientURLs":[]}` + "\n"
 	g := rw.Body.String()
 	if g != wb {
 		t.Errorf("got body=%q, want %q", g, wb)
 	}
 
 	wm := membership.Member{
-		ID: 3064321551348478165,
+		ID: 14022875665250782151,
 		RaftAttributes: membership.RaftAttributes{
 			PeerURLs: []string{"http://127.0.0.1:1"},
 		},
@@ -833,7 +882,7 @@ func TestServeMembersUpdate(t *testing.T) {
 func TestServeMembersFail(t *testing.T) {
 	tests := []struct {
 		req    *http.Request
-		server etcdserver.Server
+		server etcdserver.ServerV2
 
 		wcode int
 	}{
@@ -900,7 +949,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				errors.New("Error while adding a member"),
+				err: errors.New("Error while adding a member"),
 			},
 
 			http.StatusInternalServerError,
@@ -914,7 +963,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				membership.ErrIDExists,
+				err: membership.ErrIDExists,
 			},
 
 			http.StatusConflict,
@@ -928,7 +977,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				membership.ErrPeerURLexists,
+				err: membership.ErrPeerURLexists,
 			},
 
 			http.StatusConflict,
@@ -940,7 +989,7 @@ func TestServeMembersFail(t *testing.T) {
 				Method: "DELETE",
 			},
 			&errServer{
-				errors.New("Error while removing member"),
+				err: errors.New("Error while removing member"),
 			},
 
 			http.StatusInternalServerError,
@@ -952,7 +1001,7 @@ func TestServeMembersFail(t *testing.T) {
 				Method: "DELETE",
 			},
 			&errServer{
-				membership.ErrIDRemoved,
+				err: membership.ErrIDRemoved,
 			},
 
 			http.StatusGone,
@@ -964,7 +1013,7 @@ func TestServeMembersFail(t *testing.T) {
 				Method: "DELETE",
 			},
 			&errServer{
-				membership.ErrIDNotFound,
+				err: membership.ErrIDNotFound,
 			},
 
 			http.StatusNotFound,
@@ -1034,7 +1083,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				errors.New("blah"),
+				err: errors.New("blah"),
 			},
 
 			http.StatusInternalServerError,
@@ -1048,7 +1097,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				membership.ErrPeerURLexists,
+				err: membership.ErrPeerURLexists,
 			},
 
 			http.StatusConflict,
@@ -1062,7 +1111,7 @@ func TestServeMembersFail(t *testing.T) {
 				Header: map[string][]string{"Content-Type": {"application/json"}},
 			},
 			&errServer{
-				membership.ErrIDNotFound,
+				err: membership.ErrIDNotFound,
 			},
 
 			http.StatusNotFound,
@@ -1112,7 +1161,7 @@ func TestServeMembersFail(t *testing.T) {
 func TestWriteEvent(t *testing.T) {
 	// nil event should not panic
 	rec := httptest.NewRecorder()
-	writeKeyEvent(rec, nil, dummyRaftTimer{})
+	writeKeyEvent(rec, etcdserver.Response{}, false)
 	h := rec.Header()
 	if len(h) > 0 {
 		t.Fatalf("unexpected non-empty headers: %#v", h)
@@ -1123,8 +1172,9 @@ func TestWriteEvent(t *testing.T) {
 	}
 
 	tests := []struct {
-		ev  *store.Event
-		idx string
+		ev      *store.Event
+		noValue bool
+		idx     string
 		// TODO(jonboulle): check body as well as just status code
 		code int
 		err  error
@@ -1136,6 +1186,7 @@ func TestWriteEvent(t *testing.T) {
 				Node:     &store.NodeExtern{},
 				PrevNode: &store.NodeExtern{},
 			},
+			false,
 			"0",
 			http.StatusOK,
 			nil,
@@ -1147,6 +1198,7 @@ func TestWriteEvent(t *testing.T) {
 				Node:     &store.NodeExtern{},
 				PrevNode: &store.NodeExtern{},
 			},
+			false,
 			"0",
 			http.StatusCreated,
 			nil,
@@ -1155,7 +1207,8 @@ func TestWriteEvent(t *testing.T) {
 
 	for i, tt := range tests {
 		rw := httptest.NewRecorder()
-		writeKeyEvent(rw, tt.ev, dummyRaftTimer{})
+		resp := etcdserver.Response{Event: tt.ev, Term: 5, Index: 100}
+		writeKeyEvent(rw, resp, tt.noValue)
 		if gct := rw.Header().Get("Content-Type"); gct != "application/json" {
 			t.Errorf("case %d: bad Content-Type: got %q, want application/json", i, gct)
 		}
@@ -1175,7 +1228,7 @@ func TestWriteEvent(t *testing.T) {
 	}
 }
 
-func TestV2DeprecatedMachinesEndpoint(t *testing.T) {
+func TestV2DMachinesEndpoint(t *testing.T) {
 	tests := []struct {
 		method string
 		wcode  int
@@ -1185,12 +1238,12 @@ func TestV2DeprecatedMachinesEndpoint(t *testing.T) {
 		{"POST", http.StatusMethodNotAllowed},
 	}
 
-	m := &deprecatedMachinesHandler{cluster: &fakeCluster{}}
+	m := &machinesHandler{cluster: &fakeCluster{}}
 	s := httptest.NewServer(m)
 	defer s.Close()
 
 	for _, tt := range tests {
-		req, err := http.NewRequest(tt.method, s.URL+deprecatedMachinesPrefix, nil)
+		req, err := http.NewRequest(tt.method, s.URL+machinesPrefix, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1214,7 +1267,7 @@ func TestServeMachines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &deprecatedMachinesHandler{cluster: cluster}
+	h := &machinesHandler{cluster: cluster}
 	h.ServeHTTP(writer, req)
 	w := "http://localhost:8080, http://localhost:8081, http://localhost:8082"
 	if g := writer.Body.String(); g != w {
@@ -1364,52 +1417,10 @@ func TestServeStoreStats(t *testing.T) {
 
 }
 
-func TestServeVersion(t *testing.T) {
-	req, err := http.NewRequest("GET", "", nil)
-	if err != nil {
-		t.Fatalf("error creating request: %v", err)
-	}
-	rw := httptest.NewRecorder()
-	serveVersion(rw, req, "2.1.0")
-	if rw.Code != http.StatusOK {
-		t.Errorf("code=%d, want %d", rw.Code, http.StatusOK)
-	}
-	vs := version.Versions{
-		Server:  version.Version,
-		Cluster: "2.1.0",
-	}
-	w, err := json.Marshal(&vs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if g := rw.Body.String(); g != string(w) {
-		t.Fatalf("body = %q, want %q", g, string(w))
-	}
-	if ct := rw.HeaderMap.Get("Content-Type"); ct != "application/json" {
-		t.Errorf("contet-type header = %s, want %s", ct, "application/json")
-	}
-}
-
-func TestServeVersionFails(t *testing.T) {
-	for _, m := range []string{
-		"CONNECT", "TRACE", "PUT", "POST", "HEAD",
-	} {
-		req, err := http.NewRequest(m, "", nil)
-		if err != nil {
-			t.Fatalf("error creating request: %v", err)
-		}
-		rw := httptest.NewRecorder()
-		serveVersion(rw, req, "2.1.0")
-		if rw.Code != http.StatusMethodNotAllowed {
-			t.Errorf("method %s: code=%d, want %d", m, rw.Code, http.StatusMethodNotAllowed)
-		}
-	}
-}
-
 func TestBadServeKeys(t *testing.T) {
 	testBadCases := []struct {
 		req    *http.Request
-		server etcdserver.Server
+		server etcdserver.ServerV2
 
 		wcode int
 		wbody string
@@ -1449,7 +1460,7 @@ func TestBadServeKeys(t *testing.T) {
 			// etcdserver.Server error
 			mustNewRequest(t, "foo"),
 			&errServer{
-				errors.New("Internal Server Error"),
+				err: errors.New("Internal Server Error"),
 			},
 
 			http.StatusInternalServerError,
@@ -1459,7 +1470,7 @@ func TestBadServeKeys(t *testing.T) {
 			// etcdserver.Server etcd error
 			mustNewRequest(t, "foo"),
 			&errServer{
-				etcdErr.NewError(etcdErr.EcodeKeyNotFound, "/1/pant", 0),
+				err: etcdErr.NewError(etcdErr.EcodeKeyNotFound, "/1/pant", 0),
 			},
 
 			http.StatusNotFound,
@@ -1469,7 +1480,7 @@ func TestBadServeKeys(t *testing.T) {
 			// non-event/watcher response from etcdserver.Server
 			mustNewRequest(t, "foo"),
 			&resServer{
-				etcdserver.Response{},
+				res: etcdserver.Response{},
 			},
 
 			http.StatusInternalServerError,
@@ -1527,7 +1538,7 @@ func TestServeKeysGood(t *testing.T) {
 		},
 	}
 	server := &resServer{
-		etcdserver.Response{
+		res: etcdserver.Response{
 			Event: &store.Event{
 				Action: store.Get,
 				Node:   &store.NodeExtern{},
@@ -1538,7 +1549,6 @@ func TestServeKeysGood(t *testing.T) {
 		h := &keysHandler{
 			timeout: time.Hour,
 			server:  server,
-			timer:   &dummyRaftTimer{},
 			cluster: &fakeCluster{id: 1},
 		}
 		rw := httptest.NewRecorder()
@@ -1550,45 +1560,75 @@ func TestServeKeysGood(t *testing.T) {
 }
 
 func TestServeKeysEvent(t *testing.T) {
-	req := mustNewRequest(t, "foo")
-	server := &resServer{
-		etcdserver.Response{
-			Event: &store.Event{
+	tests := []struct {
+		req   *http.Request
+		rsp   etcdserver.Response
+		wcode int
+		event *store.Event
+	}{
+		{
+			mustNewRequest(t, "foo"),
+			etcdserver.Response{
+				Event: &store.Event{
+					Action: store.Get,
+					Node:   &store.NodeExtern{},
+				},
+			},
+			http.StatusOK,
+			&store.Event{
 				Action: store.Get,
 				Node:   &store.NodeExtern{},
 			},
 		},
+		{
+			mustNewForm(
+				t,
+				"foo",
+				url.Values{"noValueOnSuccess": []string{"true"}},
+			),
+			etcdserver.Response{
+				Event: &store.Event{
+					Action: store.CompareAndSwap,
+					Node:   &store.NodeExtern{},
+				},
+			},
+			http.StatusOK,
+			&store.Event{
+				Action: store.CompareAndSwap,
+				Node:   nil,
+			},
+		},
 	}
+
+	server := &resServer{}
 	h := &keysHandler{
 		timeout: time.Hour,
 		server:  server,
 		cluster: &fakeCluster{id: 1},
-		timer:   &dummyRaftTimer{},
 	}
-	rw := httptest.NewRecorder()
 
-	h.ServeHTTP(rw, req)
+	for _, tt := range tests {
+		server.res = tt.rsp
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, tt.req)
 
-	wcode := http.StatusOK
-	wbody := mustMarshalEvent(
-		t,
-		&store.Event{
-			Action: store.Get,
-			Node:   &store.NodeExtern{},
-		},
-	)
+		wbody := mustMarshalEvent(
+			t,
+			tt.event,
+		)
 
-	if rw.Code != wcode {
-		t.Errorf("got code=%d, want %d", rw.Code, wcode)
-	}
-	gcid := rw.Header().Get("X-Etcd-Cluster-ID")
-	wcid := h.cluster.ID().String()
-	if gcid != wcid {
-		t.Errorf("cid = %s, want %s", gcid, wcid)
-	}
-	g := rw.Body.String()
-	if g != wbody {
-		t.Errorf("got body=%#v, want %#v", g, wbody)
+		if rw.Code != tt.wcode {
+			t.Errorf("got code=%d, want %d", rw.Code, tt.wcode)
+		}
+		gcid := rw.Header().Get("X-Etcd-Cluster-ID")
+		wcid := h.cluster.ID().String()
+		if gcid != wcid {
+			t.Errorf("cid = %s, want %s", gcid, wcid)
+		}
+		g := rw.Body.String()
+		if g != wbody {
+			t.Errorf("got body=%#v, want %#v", g, wbody)
+		}
 	}
 }
 
@@ -1599,7 +1639,7 @@ func TestServeKeysWatch(t *testing.T) {
 		echan: ec,
 	}
 	server := &resServer{
-		etcdserver.Response{
+		res: etcdserver.Response{
 			Watcher: dw,
 		},
 	}
@@ -1607,7 +1647,6 @@ func TestServeKeysWatch(t *testing.T) {
 		timeout: time.Hour,
 		server:  server,
 		cluster: &fakeCluster{id: 1},
-		timer:   &dummyRaftTimer{},
 	}
 	go func() {
 		ec <- &store.Event{
@@ -1731,7 +1770,8 @@ func TestHandleWatch(t *testing.T) {
 		}
 		tt.doToChan(wa.echan)
 
-		handleKeyWatch(tt.getCtx(), rw, wa, false, dummyRaftTimer{})
+		resp := etcdserver.Response{Term: 5, Index: 100, Watcher: wa}
+		handleKeyWatch(tt.getCtx(), rw, resp, false)
 
 		wcode := http.StatusOK
 		wct := "application/json"
@@ -1775,7 +1815,8 @@ func TestHandleWatchStreaming(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		handleKeyWatch(ctx, rw, wa, true, dummyRaftTimer{})
+		resp := etcdserver.Response{Watcher: wa}
+		handleKeyWatch(ctx, rw, resp, true)
 		close(done)
 	}()
 

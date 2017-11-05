@@ -15,41 +15,43 @@
 package concurrency
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
 	v3 "github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 )
 
 // Mutex implements the sync Locker interface with etcd
 type Mutex struct {
-	client *v3.Client
+	s *Session
 
 	pfx   string
 	myKey string
 	myRev int64
+	hdr   *pb.ResponseHeader
 }
 
-func NewMutex(client *v3.Client, pfx string) *Mutex {
-	return &Mutex{client, pfx, "", -1}
+func NewMutex(s *Session, pfx string) *Mutex {
+	return &Mutex{s, pfx + "/", "", -1, nil}
 }
 
-// Lock locks the mutex with a cancellable context. If the context is cancelled
+// Lock locks the mutex with a cancelable context. If the context is canceled
 // while trying to acquire the lock, the mutex tries to clean its stale lock entry.
 func (m *Mutex) Lock(ctx context.Context) error {
-	s, serr := NewSession(m.client)
-	if serr != nil {
-		return serr
-	}
+	s := m.s
+	client := m.s.Client()
 
-	m.myKey = fmt.Sprintf("%s/%x", m.pfx, s.Lease())
+	m.myKey = fmt.Sprintf("%s%x", m.pfx, s.Lease())
 	cmp := v3.Compare(v3.CreateRevision(m.myKey), "=", 0)
 	// put self in lock waiters via myKey; oldest waiter holds lock
 	put := v3.OpPut(m.myKey, "", v3.WithLease(s.Lease()))
 	// reuse key in case this session already holds the lock
 	get := v3.OpGet(m.myKey)
-	resp, err := m.client.Txn(ctx).If(cmp).Then(put).Else(get).Commit()
+	// fetch current holder to complete uncontended path with only one RPC
+	getOwner := v3.OpGet(m.pfx, v3.WithFirstCreate()...)
+	resp, err := client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
 	if err != nil {
 		return err
 	}
@@ -57,20 +59,28 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	if !resp.Succeeded {
 		m.myRev = resp.Responses[0].GetResponseRange().Kvs[0].CreateRevision
 	}
+	// if no key on prefix / the minimum rev is key, already hold the lock
+	ownerKey := resp.Responses[1].GetResponseRange().Kvs
+	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
+		m.hdr = resp.Header
+		return nil
+	}
 
 	// wait for deletion revisions prior to myKey
-	err = waitDeletes(ctx, m.client, m.pfx, v3.WithPrefix(), v3.WithRev(m.myRev-1))
+	hdr, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
 	// release lock key if cancelled
 	select {
 	case <-ctx.Done():
-		m.Unlock(m.client.Ctx())
+		m.Unlock(client.Ctx())
 	default:
+		m.hdr = hdr
 	}
-	return err
+	return werr
 }
 
 func (m *Mutex) Unlock(ctx context.Context) error {
-	if _, err := m.client.Delete(ctx, m.myKey); err != nil {
+	client := m.s.Client()
+	if _, err := client.Delete(ctx, m.myKey); err != nil {
 		return err
 	}
 	m.myKey = "\x00"
@@ -84,20 +94,25 @@ func (m *Mutex) IsOwner() v3.Cmp {
 
 func (m *Mutex) Key() string { return m.myKey }
 
+// Header is the response header received from etcd on acquiring the lock.
+func (m *Mutex) Header() *pb.ResponseHeader { return m.hdr }
+
 type lockerMutex struct{ *Mutex }
 
 func (lm *lockerMutex) Lock() {
-	if err := lm.Mutex.Lock(lm.client.Ctx()); err != nil {
+	client := lm.s.Client()
+	if err := lm.Mutex.Lock(client.Ctx()); err != nil {
 		panic(err)
 	}
 }
 func (lm *lockerMutex) Unlock() {
-	if err := lm.Mutex.Unlock(lm.client.Ctx()); err != nil {
+	client := lm.s.Client()
+	if err := lm.Mutex.Unlock(client.Ctx()); err != nil {
 		panic(err)
 	}
 }
 
 // NewLocker creates a sync.Locker backed by an etcd mutex.
-func NewLocker(client *v3.Client, pfx string) sync.Locker {
-	return &lockerMutex{NewMutex(client, pfx)}
+func NewLocker(s *Session, pfx string) sync.Locker {
+	return &lockerMutex{NewMutex(s, pfx)}
 }

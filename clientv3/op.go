@@ -23,6 +23,7 @@ const (
 	tRange opType = iota + 1
 	tPut
 	tDeleteRange
+	tTxn
 )
 
 var (
@@ -41,6 +42,10 @@ type Op struct {
 	serializable bool
 	keysOnly     bool
 	countOnly    bool
+	minModRev    int64
+	maxModRev    int64
+	minCreateRev int64
+	maxCreateRev int64
 
 	// for range, watch
 	rev int64
@@ -48,44 +53,155 @@ type Op struct {
 	// for watch, put, delete
 	prevKV bool
 
+	// for put
+	ignoreValue bool
+	ignoreLease bool
+
 	// progressNotify is for progress updates.
 	progressNotify bool
+	// createdNotify is for created event
+	createdNotify bool
+	// filters for watchers
+	filterPut    bool
+	filterDelete bool
 
 	// for put
 	val     []byte
 	leaseID LeaseID
+
+	// txn
+	cmps    []Cmp
+	thenOps []Op
+	elseOps []Op
+}
+
+// accessors / mutators
+
+func (op Op) IsTxn() bool              { return op.t == tTxn }
+func (op Op) Txn() ([]Cmp, []Op, []Op) { return op.cmps, op.thenOps, op.elseOps }
+
+// KeyBytes returns the byte slice holding the Op's key.
+func (op Op) KeyBytes() []byte { return op.key }
+
+// WithKeyBytes sets the byte slice for the Op's key.
+func (op *Op) WithKeyBytes(key []byte) { op.key = key }
+
+// RangeBytes returns the byte slice holding with the Op's range end, if any.
+func (op Op) RangeBytes() []byte { return op.end }
+
+// Rev returns the requested revision, if any.
+func (op Op) Rev() int64 { return op.rev }
+
+// IsPut returns true iff the operation is a Put.
+func (op Op) IsPut() bool { return op.t == tPut }
+
+// IsGet returns true iff the operation is a Get.
+func (op Op) IsGet() bool { return op.t == tRange }
+
+// IsDelete returns true iff the operation is a Delete.
+func (op Op) IsDelete() bool { return op.t == tDeleteRange }
+
+// IsSerializable returns true if the serializable field is true.
+func (op Op) IsSerializable() bool { return op.serializable == true }
+
+// IsKeysOnly returns whether keysOnly is set.
+func (op Op) IsKeysOnly() bool { return op.keysOnly == true }
+
+// IsCountOnly returns whether countOnly is set.
+func (op Op) IsCountOnly() bool { return op.countOnly == true }
+
+// MinModRev returns the operation's minimum modify revision.
+func (op Op) MinModRev() int64 { return op.minModRev }
+
+// MaxModRev returns the operation's maximum modify revision.
+func (op Op) MaxModRev() int64 { return op.maxModRev }
+
+// MinCreateRev returns the operation's minimum create revision.
+func (op Op) MinCreateRev() int64 { return op.minCreateRev }
+
+// MaxCreateRev returns the operation's maximum create revision.
+func (op Op) MaxCreateRev() int64 { return op.maxCreateRev }
+
+// WithRangeBytes sets the byte slice for the Op's range end.
+func (op *Op) WithRangeBytes(end []byte) { op.end = end }
+
+// ValueBytes returns the byte slice holding the Op's value, if any.
+func (op Op) ValueBytes() []byte { return op.val }
+
+// WithValueBytes sets the byte slice for the Op's value.
+func (op *Op) WithValueBytes(v []byte) { op.val = v }
+
+func (op Op) toRangeRequest() *pb.RangeRequest {
+	if op.t != tRange {
+		panic("op.t != tRange")
+	}
+	r := &pb.RangeRequest{
+		Key:               op.key,
+		RangeEnd:          op.end,
+		Limit:             op.limit,
+		Revision:          op.rev,
+		Serializable:      op.serializable,
+		KeysOnly:          op.keysOnly,
+		CountOnly:         op.countOnly,
+		MinModRevision:    op.minModRev,
+		MaxModRevision:    op.maxModRev,
+		MinCreateRevision: op.minCreateRev,
+		MaxCreateRevision: op.maxCreateRev,
+	}
+	if op.sort != nil {
+		r.SortOrder = pb.RangeRequest_SortOrder(op.sort.Order)
+		r.SortTarget = pb.RangeRequest_SortTarget(op.sort.Target)
+	}
+	return r
+}
+
+func (op Op) toTxnRequest() *pb.TxnRequest {
+	thenOps := make([]*pb.RequestOp, len(op.thenOps))
+	for i, tOp := range op.thenOps {
+		thenOps[i] = tOp.toRequestOp()
+	}
+	elseOps := make([]*pb.RequestOp, len(op.elseOps))
+	for i, eOp := range op.elseOps {
+		elseOps[i] = eOp.toRequestOp()
+	}
+	cmps := make([]*pb.Compare, len(op.cmps))
+	for i := range op.cmps {
+		cmps[i] = (*pb.Compare)(&op.cmps[i])
+	}
+	return &pb.TxnRequest{Compare: cmps, Success: thenOps, Failure: elseOps}
 }
 
 func (op Op) toRequestOp() *pb.RequestOp {
 	switch op.t {
 	case tRange:
-		r := &pb.RangeRequest{
-			Key:          op.key,
-			RangeEnd:     op.end,
-			Limit:        op.limit,
-			Revision:     op.rev,
-			Serializable: op.serializable,
-			KeysOnly:     op.keysOnly,
-			CountOnly:    op.countOnly,
-		}
-		if op.sort != nil {
-			r.SortOrder = pb.RangeRequest_SortOrder(op.sort.Order)
-			r.SortTarget = pb.RangeRequest_SortTarget(op.sort.Target)
-		}
-		return &pb.RequestOp{Request: &pb.RequestOp_RequestRange{RequestRange: r}}
+		return &pb.RequestOp{Request: &pb.RequestOp_RequestRange{RequestRange: op.toRangeRequest()}}
 	case tPut:
-		r := &pb.PutRequest{Key: op.key, Value: op.val, Lease: int64(op.leaseID), PrevKv: op.prevKV}
+		r := &pb.PutRequest{Key: op.key, Value: op.val, Lease: int64(op.leaseID), PrevKv: op.prevKV, IgnoreValue: op.ignoreValue, IgnoreLease: op.ignoreLease}
 		return &pb.RequestOp{Request: &pb.RequestOp_RequestPut{RequestPut: r}}
 	case tDeleteRange:
 		r := &pb.DeleteRangeRequest{Key: op.key, RangeEnd: op.end, PrevKv: op.prevKV}
-
 		return &pb.RequestOp{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: r}}
+	case tTxn:
+		return &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{RequestTxn: op.toTxnRequest()}}
 	default:
 		panic("Unknown Op")
 	}
 }
 
 func (op Op) isWrite() bool {
+	if op.t == tTxn {
+		for _, tOp := range op.thenOps {
+			if tOp.isWrite() {
+				return true
+			}
+		}
+		for _, tOp := range op.elseOps {
+			if tOp.isWrite() {
+				return true
+			}
+		}
+		return false
+	}
 	return op.t != tRange
 }
 
@@ -111,6 +227,14 @@ func OpDelete(key string, opts ...OpOption) Op {
 		panic("unexpected serializable in delete")
 	case ret.countOnly:
 		panic("unexpected countOnly in delete")
+	case ret.minModRev != 0, ret.maxModRev != 0:
+		panic("unexpected mod revision filter in delete")
+	case ret.minCreateRev != 0, ret.maxCreateRev != 0:
+		panic("unexpected create revision filter in delete")
+	case ret.filterDelete, ret.filterPut:
+		panic("unexpected filter in delete")
+	case ret.createdNotify:
+		panic("unexpected createdNotify in delete")
 	}
 	return ret
 }
@@ -131,8 +255,20 @@ func OpPut(key, val string, opts ...OpOption) Op {
 		panic("unexpected serializable in put")
 	case ret.countOnly:
 		panic("unexpected countOnly in put")
+	case ret.minModRev != 0, ret.maxModRev != 0:
+		panic("unexpected mod revision filter in put")
+	case ret.minCreateRev != 0, ret.maxCreateRev != 0:
+		panic("unexpected create revision filter in put")
+	case ret.filterDelete, ret.filterPut:
+		panic("unexpected filter in put")
+	case ret.createdNotify:
+		panic("unexpected createdNotify in put")
 	}
 	return ret
+}
+
+func OpTxn(cmps []Cmp, thenOps []Op, elseOps []Op) Op {
+	return Op{t: tTxn, cmps: cmps, thenOps: thenOps, elseOps: elseOps}
 }
 
 func opWatch(key string, opts ...OpOption) Op {
@@ -149,6 +285,10 @@ func opWatch(key string, opts ...OpOption) Op {
 		panic("unexpected serializable in watch")
 	case ret.countOnly:
 		panic("unexpected countOnly in watch")
+	case ret.minModRev != 0, ret.maxModRev != 0:
+		panic("unexpected mod revision filter in watch")
+	case ret.minCreateRev != 0, ret.maxCreateRev != 0:
+		panic("unexpected create revision filter in watch")
 	}
 	return ret
 }
@@ -168,6 +308,7 @@ func WithLease(leaseID LeaseID) OpOption {
 }
 
 // WithLimit limits the number of results to return from 'Get' request.
+// If WithLimit is given a 0 limit, it is treated as no limit.
 func WithLimit(n int64) OpOption { return func(op *Op) { op.limit = n } }
 
 // WithRev specifies the store revision for 'Get' request.
@@ -180,6 +321,14 @@ func WithRev(rev int64) OpOption { return func(op *Op) { op.rev = rev } }
 // 'order' can be either 'SortNone', 'SortAscend', 'SortDescend'.
 func WithSort(target SortTarget, order SortOrder) OpOption {
 	return func(op *Op) {
+		if target == SortByKey && order == SortAscend {
+			// If order != SortNone, server fetches the entire key-space,
+			// and then applies the sort and limit, if provided.
+			// Since by default the server returns results sorted by keys
+			// in lexicographically ascending order, the client should ignore
+			// SortOrder if the target is SortByKey.
+			order = SortNone
+		}
 		op.sort = &SortOption{target, order}
 	}
 }
@@ -210,18 +359,23 @@ func getPrefix(key []byte) []byte {
 // can return 'foo1', 'foo2', and so on.
 func WithPrefix() OpOption {
 	return func(op *Op) {
+		if len(op.key) == 0 {
+			op.key, op.end = []byte{0}, []byte{0}
+			return
+		}
 		op.end = getPrefix(op.key)
 	}
 }
 
-// WithRange specifies the range of 'Get' or 'Delete' requests.
+// WithRange specifies the range of 'Get', 'Delete', 'Watch' requests.
 // For example, 'Get' requests with 'WithRange(end)' returns
 // the keys in the range [key, end).
+// endKey must be lexicographically greater than start key.
 func WithRange(endKey string) OpOption {
 	return func(op *Op) { op.end = []byte(endKey) }
 }
 
-// WithFromKey specifies the range of 'Get' or 'Delete' requests
+// WithFromKey specifies the range of 'Get', 'Delete', 'Watch' requests
 // to be equal or greater than the key in the argument.
 func WithFromKey() OpOption { return WithRange("\x00") }
 
@@ -242,6 +396,18 @@ func WithKeysOnly() OpOption {
 func WithCountOnly() OpOption {
 	return func(op *Op) { op.countOnly = true }
 }
+
+// WithMinModRev filters out keys for Get with modification revisions less than the given revision.
+func WithMinModRev(rev int64) OpOption { return func(op *Op) { op.minModRev = rev } }
+
+// WithMaxModRev filters out keys for Get with modification revisions greater than the given revision.
+func WithMaxModRev(rev int64) OpOption { return func(op *Op) { op.maxModRev = rev } }
+
+// WithMinCreateRev filters out keys for Get with creation revisions less than the given revision.
+func WithMinCreateRev(rev int64) OpOption { return func(op *Op) { op.minCreateRev = rev } }
+
+// WithMaxCreateRev filters out keys for Get with creation revisions greater than the given revision.
+func WithMaxCreateRev(rev int64) OpOption { return func(op *Op) { op.maxCreateRev = rev } }
 
 // WithFirstCreate gets the key with the oldest creation revision in the request range.
 func WithFirstCreate() []OpOption { return withTop(SortByCreateRevision, SortAscend) }
@@ -266,12 +432,30 @@ func withTop(target SortTarget, order SortOrder) []OpOption {
 	return []OpOption{WithPrefix(), WithSort(target, order), WithLimit(1)}
 }
 
-// WithProgressNotify makes watch server send periodic progress updates.
+// WithProgressNotify makes watch server send periodic progress updates
+// every 10 minutes when there is no incoming events.
 // Progress updates have zero events in WatchResponse.
 func WithProgressNotify() OpOption {
 	return func(op *Op) {
 		op.progressNotify = true
 	}
+}
+
+// WithCreatedNotify makes watch server sends the created event.
+func WithCreatedNotify() OpOption {
+	return func(op *Op) {
+		op.createdNotify = true
+	}
+}
+
+// WithFilterPut discards PUT events from the watcher.
+func WithFilterPut() OpOption {
+	return func(op *Op) { op.filterPut = true }
+}
+
+// WithFilterDelete discards DELETE events from the watcher.
+func WithFilterDelete() OpOption {
+	return func(op *Op) { op.filterDelete = true }
 }
 
 // WithPrevKV gets the previous key-value pair before the event happens. If the previous KV is already compacted,
@@ -280,4 +464,50 @@ func WithPrevKV() OpOption {
 	return func(op *Op) {
 		op.prevKV = true
 	}
+}
+
+// WithIgnoreValue updates the key using its current value.
+// This option can not be combined with non-empty values.
+// Returns an error if the key does not exist.
+func WithIgnoreValue() OpOption {
+	return func(op *Op) {
+		op.ignoreValue = true
+	}
+}
+
+// WithIgnoreLease updates the key using its current lease.
+// This option can not be combined with WithLease.
+// Returns an error if the key does not exist.
+func WithIgnoreLease() OpOption {
+	return func(op *Op) {
+		op.ignoreLease = true
+	}
+}
+
+// LeaseOp represents an Operation that lease can execute.
+type LeaseOp struct {
+	id LeaseID
+
+	// for TimeToLive
+	attachedKeys bool
+}
+
+// LeaseOption configures lease operations.
+type LeaseOption func(*LeaseOp)
+
+func (op *LeaseOp) applyOpts(opts []LeaseOption) {
+	for _, opt := range opts {
+		opt(op)
+	}
+}
+
+// WithAttachedKeys makes TimeToLive list the keys attached to the given lease ID.
+func WithAttachedKeys() LeaseOption {
+	return func(op *LeaseOp) { op.attachedKeys = true }
+}
+
+func toLeaseTimeToLiveRequest(id LeaseID, opts ...LeaseOption) *pb.LeaseTimeToLiveRequest {
+	ret := &LeaseOp{id: id}
+	ret.applyOpts(opts)
+	return &pb.LeaseTimeToLiveRequest{ID: int64(id), Keys: ret.attachedKeys}
 }

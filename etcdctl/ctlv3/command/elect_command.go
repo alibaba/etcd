@@ -15,14 +15,16 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
+
 	"github.com/spf13/cobra"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -64,12 +66,16 @@ func electCommandFunc(cmd *cobra.Command, args []string) {
 }
 
 func observe(c *clientv3.Client, election string) error {
-	e := concurrency.NewElection(c, election)
+	s, err := concurrency.NewSession(c)
+	if err != nil {
+		return err
+	}
+	e := concurrency.NewElection(s, election)
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	donec := make(chan struct{})
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, os.Kill)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigc
 		cancel()
@@ -94,24 +100,23 @@ func observe(c *clientv3.Client, election string) error {
 }
 
 func campaign(c *clientv3.Client, election string, prop string) error {
-	e := concurrency.NewElection(c, election)
+	s, err := concurrency.NewSession(c)
+	if err != nil {
+		return err
+	}
+	e := concurrency.NewElection(s, election)
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	donec := make(chan struct{})
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, os.Kill)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigc
 		cancel()
 		close(donec)
 	}()
 
-	s, serr := concurrency.NewSession(c)
-	if serr != nil {
-		return serr
-	}
-
-	if err := e.Campaign(ctx, prop); err != nil {
+	if err = e.Campaign(ctx, prop); err != nil {
 		return err
 	}
 

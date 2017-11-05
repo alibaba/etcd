@@ -15,8 +15,11 @@
 package grpcproxy
 
 import (
+	"time"
+
 	"github.com/coreos/etcd/clientv3"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/mvcc"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
@@ -24,34 +27,103 @@ type watchRange struct {
 	key, end string
 }
 
-type watcher struct {
-	id int64
-	wr watchRange
-	// TODO: support filter
-	progress bool
-	ch       chan<- *pb.WatchResponse
+func (wr *watchRange) valid() bool {
+	return len(wr.end) == 0 || wr.end > wr.key || (wr.end[0] == 0 && len(wr.end) == 1)
 }
 
+type watcher struct {
+	// user configuration
+
+	wr       watchRange
+	filters  []mvcc.FilterFunc
+	progress bool
+	prevKV   bool
+
+	// id is the id returned to the client on its watch stream.
+	id int64
+	// nextrev is the minimum expected next event revision.
+	nextrev int64
+	// lastHeader has the last header sent over the stream.
+	lastHeader pb.ResponseHeader
+
+	// wps is the parent.
+	wps *watchProxyStream
+}
+
+// send filters out repeated events by discarding revisions older
+// than the last one sent over the watch channel.
 func (w *watcher) send(wr clientv3.WatchResponse) {
 	if wr.IsProgressNotify() && !w.progress {
 		return
 	}
-
-	// todo: filter out the events that this watcher already seen.
-
-	evs := wr.Events
-	events := make([]*mvccpb.Event, len(evs))
-	for i := range evs {
-		events[i] = (*mvccpb.Event)(evs[i])
+	if w.nextrev > wr.Header.Revision && len(wr.Events) > 0 {
+		return
 	}
-	pbwr := &pb.WatchResponse{
-		Header:  &wr.Header,
-		WatchId: w.id,
-		Events:  events,
+	if w.nextrev == 0 {
+		// current watch; expect updates following this revision
+		w.nextrev = wr.Header.Revision + 1
 	}
+
+	events := make([]*mvccpb.Event, 0, len(wr.Events))
+
+	var lastRev int64
+	for i := range wr.Events {
+		ev := (*mvccpb.Event)(wr.Events[i])
+		if ev.Kv.ModRevision < w.nextrev {
+			continue
+		} else {
+			// We cannot update w.rev here.
+			// txn can have multiple events with the same rev.
+			// If w.nextrev updates here, it would skip events in the same txn.
+			lastRev = ev.Kv.ModRevision
+		}
+
+		filtered := false
+		for _, filter := range w.filters {
+			if filter(*ev) {
+				filtered = true
+				break
+			}
+		}
+		if filtered {
+			continue
+		}
+
+		if !w.prevKV {
+			evCopy := *ev
+			evCopy.PrevKv = nil
+			ev = &evCopy
+		}
+		events = append(events, ev)
+	}
+
+	if lastRev >= w.nextrev {
+		w.nextrev = lastRev + 1
+	}
+
+	// all events are filtered out?
+	if !wr.IsProgressNotify() && !wr.Created && len(events) == 0 && wr.CompactRevision == 0 {
+		return
+	}
+
+	w.lastHeader = wr.Header
+	w.post(&pb.WatchResponse{
+		Header:          &wr.Header,
+		Created:         wr.Created,
+		CompactRevision: wr.CompactRevision,
+		Canceled:        wr.Canceled,
+		WatchId:         w.id,
+		Events:          events,
+	})
+}
+
+// post puts a watch response on the watcher's proxy stream channel
+func (w *watcher) post(wr *pb.WatchResponse) bool {
 	select {
-	case w.ch <- pbwr:
-	default:
-		panic("handle this")
+	case w.wps.watchCh <- wr:
+	case <-time.After(50 * time.Millisecond):
+		w.wps.cancel()
+		return false
 	}
+	return true
 }
